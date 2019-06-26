@@ -5,11 +5,15 @@
 pipeline {
   agent any
   environment {
+    REPO = 'apm-agent-go'
     BASE_DIR = "src/go.elastic.co/apm"
     NOTIFY_TO = credentials('notify-to')
     JOB_GCS_BUCKET = credentials('gcs-bucket')
     CODECOV_SECRET = 'secret/apm-team/ci/apm-agent-go-codecov'
     GO111MODULE = 'on'
+    GOPROXY = 'https://proxy.golang.org'
+    GITHUB_CHECK_ITS_NAME = 'Integration Tests'
+    ITS_PIPELINE = 'apm-integration-tests-selector-mbp/master'
   }
   options {
     timeout(time: 1, unit: 'HOURS')
@@ -57,10 +61,12 @@ pipeline {
         */
         stage('build') {
           steps {
-            deleteDir()
-            unstash 'source'
-            dir("${BASE_DIR}"){
-              sh './scripts/jenkins/build.sh'
+            withGithubNotify(context: 'Build') {
+              deleteDir()
+              unstash 'source'
+              dir("${BASE_DIR}"){
+                sh './scripts/jenkins/build.sh'
+              }
             }
           }
         }
@@ -86,10 +92,12 @@ pipeline {
             expression { return params.test_ci }
           }
           steps {
-            deleteDir()
-            unstash 'source'
-            dir("${BASE_DIR}"){
-              sh './scripts/jenkins/test.sh'
+            withGithubNotify(context: 'Unit Test', tab: 'tests') {
+              deleteDir()
+              unstash 'source'
+              dir("${BASE_DIR}"){
+                sh './scripts/jenkins/test.sh'
+              }
             }
           }
           post {
@@ -126,11 +134,13 @@ pipeline {
             }
           }
           steps {
-            deleteDir()
-            unstash 'source'
-            dir("${BASE_DIR}"){
-              sh './scripts/jenkins/bench.sh'
-              sendBenchmarks(file: 'build/bench.out', index: "benchmark-go")
+            withGithubNotify(context: 'Benchmarks', tab: 'tests') {
+              deleteDir()
+              unstash 'source'
+              dir("${BASE_DIR}"){
+                sh './scripts/jenkins/bench.sh'
+                sendBenchmarks(file: 'build/bench.out', index: "benchmark-go")
+              }
             }
           }
           post {
@@ -144,7 +154,7 @@ pipeline {
         /**
           Run tests in a docker container and store the results in jenkins and codecov.
         */
-        stage('Docker tests') {
+        stage('Docker Tests') {
           agent { label 'linux && docker && immutable' }
           options { skipDefaultCheckout() }
           environment {
@@ -158,10 +168,12 @@ pipeline {
             expression { return params.docker_test_ci }
           }
           steps {
-            deleteDir()
-            unstash 'source'
-            dir("${BASE_DIR}"){
-              sh './scripts/jenkins/docker-test.sh'
+            withGithubNotify(context: 'Docker Tests', tab: 'tests') {
+              deleteDir()
+              unstash 'source'
+              dir("${BASE_DIR}"){
+                sh './scripts/jenkins/docker-test.sh'
+              }
             }
           }
           post {
@@ -170,7 +182,7 @@ pipeline {
               junit(allowEmptyResults: true,
                 keepLongStdio: true,
                 testResults: "${BASE_DIR}/build/junit-*.xml")
-              codecov(repo: 'apm-agent-go', basedir: "${BASE_DIR}",
+              codecov(repo: env.REPO, basedir: "${BASE_DIR}",
                 flags: "-f build/coverage/coverage.cov -X search",
                 secret: "${CODECOV_SECRET}")
             }
@@ -205,20 +217,32 @@ pipeline {
         }
       }
     }
+    stage('Integration Tests') {
+      agent none
+      when {
+        beforeAgent true
+        allOf {
+          anyOf {
+            environment name: 'GIT_BUILD_CAUSE', value: 'pr'
+            expression { return !params.Run_As_Master_Branch }
+          }
+        }
+      }
+      steps {
+        log(level: 'INFO', text: 'Launching Async ITs')
+        build(job: env.ITS_PIPELINE, propagate: false, wait: false,
+              parameters: [string(name: 'AGENT_INTEGRATION_TEST', value: 'Go'),
+                           string(name: 'BUILD_OPTS', value: "--go-agent-version ${env.GIT_BASE_COMMIT}"),
+                           string(name: 'GITHUB_CHECK_NAME', value: env.GITHUB_CHECK_ITS_NAME),
+                           string(name: 'GITHUB_CHECK_REPO', value: env.REPO),
+                           string(name: 'GITHUB_CHECK_SHA1', value: env.GIT_BASE_COMMIT)])
+        githubNotify(context: "${env.GITHUB_CHECK_ITS_NAME}", description: "${env.GITHUB_CHECK_ITS_NAME} ...", status: 'PENDING', targetUrl: "${env.JENKINS_URL}search/?q=${env.ITS_PIPELINE.replaceAll('/','+')}")
+      }
+    }
   }
   post {
-    success {
-      echoColor(text: '[SUCCESS]', colorfg: 'green', colorbg: 'default')
-    }
-    aborted {
-      echoColor(text: '[ABORTED]', colorfg: 'magenta', colorbg: 'default')
-    }
-    failure {
-      echoColor(text: '[FAILURE]', colorfg: 'red', colorbg: 'default')
-      step([$class: 'Mailer', notifyEveryUnstableBuild: true, recipients: "${NOTIFY_TO}", sendToIndividuals: false])
-    }
-    unstable {
-      echoColor(text: '[UNSTABLE]', colorfg: 'yellow', colorbg: 'default')
+    always {
+      notifyBuildResult()
     }
   }
 }
